@@ -693,6 +693,7 @@ def gather_data(
                         driver,
                         '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[2]',
                     )
+                    cc_number = ''.join(cc_number.split())
                     cc_exp = read_optional_panel_text(
                         driver,
                         '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[4]/div[1]',
