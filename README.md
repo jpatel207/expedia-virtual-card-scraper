@@ -122,6 +122,8 @@ The report is filtered rather than being a complete export of all reservations:
 
 `Needs Review` and `Review Note` explain cases such as unreadable amounts, incomplete card details, canceled reservations, or an expired charge window. A reported balance does not establish that a card is currently chargeable; review Expedia's status and eligibility information.
 
+When Expedia still cannot display a virtual card after **Refresh card**, the report records that reservation as **Virtual card unavailable** with a blank amount and card details. It remains flagged for manual review; the script does not infer a chargeable balance.
+
 ## Progress saving and recovery
 
 At the beginning of a scan, the script creates:
@@ -140,7 +142,7 @@ local-data/YYYY-MM-DD_HH-MM-SS_data.csv
 
 You can view an in-progress CSV in VS Code while the script runs. Avoid editing or saving it, and reopen it if the displayed contents appear stale.
 
-The script can click a visible virtual-card reload control when a card fails to load. If Expedia shows **reservations cannot be loaded**, or the details panel disappears, it attempts to reload the same search, return to the recorded page, and retry the failed reservation up to twice. It matches the failed row using its visible text and stops if it cannot identify it uniquely.
+The script can click a visible virtual-card reload control when a card fails to load. If Expedia shows **reservations cannot be loaded**, or the details panel disappears, it attempts to reload the same search, return to the recorded page, and retry the failed reservation up to twice. It matches the failed row using its visible text and stops if it cannot identify it uniquely. When card information remains unavailable, it keeps the reservation in the report for review and continues scanning.
 
 **Restarting the program does not resume from an in-progress CSV.** Choose a new custom range to rescan the unfinished month, or rerun the original range for a single complete report. Each run creates a separate file. Failed runs do not email partial results.
 

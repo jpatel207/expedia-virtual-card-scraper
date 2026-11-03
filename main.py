@@ -80,6 +80,11 @@ def get_payment_summary(
         payment['Needs Review'] = bool(notes)
         payment['Review Note'] = ' '.join(notes)
         return payment
+    if status_text == 'Virtual card unavailable':
+        notes.append('Expedia could not display the virtual card information; verify its status and amount manually.')
+        payment['Needs Review'] = True
+        payment['Review Note'] = ' '.join(notes)
+        return payment
     if status_text not in {'Ready to charge', 'Partially charged'}:
         notes.append(f'Unrecognized card status: {status_text!r}.')
     else:
@@ -417,7 +422,7 @@ def read_reservation_status(driver, row_context: str) -> tuple[str, str]:
     """Read the status text from the rendered reservation panel."""
     known_statuses = (
         'Charged in full', 'Partially charged', 'Ready to charge',
-        'Refund due', 'Deactivated', 'Canceled', 'Cancelled',
+        'Refund due', 'Deactivated',
     )
 
     def find_status(browser):
@@ -427,6 +432,11 @@ def read_reservation_status(driver, row_context: str) -> tuple[str, str]:
             return False
         lines = [line.strip() for line in panel_text.splitlines() if line.strip()]
         for status in known_statuses:
+            if any(line.casefold() == status.casefold() for line in lines):
+                return status, panel_text
+        if 'able to display your virtual card information' in panel_text.casefold():
+            return 'Virtual card unavailable', panel_text
+        for status in ('Canceled', 'Cancelled'):
             if any(line.casefold() == status.casefold() for line in lines):
                 return status, panel_text
         return False
@@ -443,10 +453,14 @@ def read_reservation_status(driver, row_context: str) -> tuple[str, str]:
                 f"Reservation details panel disappeared while reading the card status "
                 f"({row_context})."
             ) from exc
+        if 'able to display your virtual card information' in panel_text.casefold():
+            return 'Virtual card unavailable', panel_text
         return 'Unrecognized status', panel_text
 
 
-def refresh_virtual_card_if_available(driver, row_context: str, debug: bool = False) -> None:
+def refresh_virtual_card_if_available(
+    driver, row_context: str, debug: bool = False, before_refresh=None,
+) -> None:
     """Use Expedia's one-shot card reload control, then wait for its status to render."""
     lower = "translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
     lower_label = "translate(concat(@aria-label, ' ', @title), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
@@ -463,6 +477,8 @@ def refresh_virtual_card_if_available(driver, row_context: str, debug: bool = Fa
         return
 
     reload_button = reload_buttons[0]
+    if before_refresh:
+        before_refresh()
     driver.execute_script(
         "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
         reload_button,
@@ -502,8 +518,50 @@ def read_optional_panel_text(driver, xpath: str) -> str:
     """Read a panel field when present; return blank if Expedia omitted it."""
     try:
         return driver.find_element(By.XPATH, xpath).text.strip()
-    except NoSuchElementException:
+    except (NoSuchElementException, StaleElementReferenceException):
         return ''
+
+
+def capture_reservation_identity(driver, row_text: str, guest_name: str) -> dict:
+    """Keep reservation identifiers before a card refresh can remove the panel."""
+    date_text = read_optional_panel_text(
+        driver, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[2]/div[1]/div/div[1]/div',
+    )
+    check_in = check_out = None
+    try:
+        check_in_text, check_out_text = date_text.splitlines()[0].split(' - ')
+        check_in = datetime.strptime(check_in_text, '%m/%d/%Y')
+        check_out = datetime.strptime(check_out_text, '%m/%d/%Y')
+    except (IndexError, ValueError):
+        pass
+
+    expedia_number = read_optional_panel_text(
+        driver, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[1]/header/h3/span/span',
+    ).lstrip('#')
+    if not expedia_number:
+        match = re.search(r'\b\d{9,12}\b', row_text)
+        expedia_number = match.group() if match else ''
+
+    panel_text = read_optional_panel_text(driver, '//*[@id="sidePanelDialog"]')
+    return {
+        'Check In Date': check_in,
+        'Check Out Date': check_out,
+        'Guest Name': read_optional_panel_text(
+            driver, '//*[@id="sidePanelDialog"]/div/div/div/div/div[1]/div[1]/div[2]/div',
+        ) or guest_name,
+        'Expedia Number': expedia_number,
+        'Hotel Number': read_optional_panel_text(
+            driver, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[2]/div[2]/div/div/div[2]/div/span',
+        ).lstrip('#'),
+        'Reservation Canceled': any(
+            line.strip().casefold() in {'canceled', 'cancelled'}
+            for line in panel_text.splitlines()
+        ),
+        'Charge Window Passed': bool(re.search(
+            r'\b180-day\s+charge\s+window\s+for\s+this\s+card\s+has\s+passed\b',
+            panel_text, re.IGNORECASE,
+        )),
+    }
 
 
 def gather_data(
@@ -558,11 +616,14 @@ def gather_data(
             row = rows[row_number - 1]
             row_context = f"{scan_context}, row {row_number} of {len(rows)}"
             original_row_text = row.text
+            review_identity = {}
+            card_unavailable_visible = False
             if debug:
                 print(f"Opening reservation details: {row_context}")
             # Find the button within the row
             try:
                 guest_name_button = row.find_element(By.CLASS_NAME, 'fds-button2.link.guestNameLink')
+                row_guest_name = guest_name_button.text.strip()
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
                     guest_name_button,
@@ -574,9 +635,22 @@ def gather_data(
                     driver, (By.ID, "sidePanelDialog"),
                     f"opening the reservation details panel ({row_context})",
                 )
+                card_unavailable_visible = (
+                    'able to display your virtual card information'
+                    in read_optional_panel_text(driver, '//*[@id="sidePanelDialog"]').casefold()
+                )
+                if card_unavailable_visible:
+                    review_identity.update(capture_reservation_identity(
+                        driver, original_row_text, row_guest_name,
+                    ))
                 if debug:
                     print(f"Details panel opened; waiting for card status: {row_context}")
-                refresh_virtual_card_if_available(driver, row_context, debug=debug)
+                refresh_virtual_card_if_available(
+                    driver, row_context, debug=debug,
+                    before_refresh=lambda: review_identity.update(
+                        capture_reservation_identity(driver, original_row_text, row_guest_name)
+                    ),
+                )
                 status_text, panel_text = read_reservation_status(driver, row_context)
                 status_counts[status_text] += 1
                 reservation_cancelled = any(
@@ -612,15 +686,18 @@ def gather_data(
                 check_out_date = datetime.strptime(check_out_date_str, '%m/%d/%Y')
                 guest_name = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[1]/div[1]/div[2]/div').text.strip()
                 expedia_number = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[1]/header/h3/span/span').text.strip().lstrip('#')
-                cc_number = read_optional_panel_text(
-                    driver,
-                    '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[2]',
-                )
-                cc_exp = read_optional_panel_text(
-                    driver,
-                    '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[4]/div[1]',
-                )
-                if not cc_number or not cc_exp:
+                if status_text == 'Virtual card unavailable':
+                    cc_number = cc_exp = ''
+                else:
+                    cc_number = read_optional_panel_text(
+                        driver,
+                        '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[2]',
+                    )
+                    cc_exp = read_optional_panel_text(
+                        driver,
+                        '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[4]/div[1]',
+                    )
+                if status_text != 'Virtual card unavailable' and (not cc_number or not cc_exp):
                     payment['Needs Review'] = True
                     missing_card_detail_note = 'Virtual card details were not fully read.'
                     payment['Review Note'] = ' '.join(
@@ -682,6 +759,44 @@ def gather_data(
                 if not recoverable_failure:
                     raise
                 if row_retry_count >= 2:
+                    if (
+                        review_identity and review_identity['Expedia Number']
+                        and (
+                            'panel disappeared while refreshing the virtual card' in error_text
+                            or (
+                                (card_unavailable_visible or review_identity)
+                                and 'panel disappeared while reading the card status' in error_text
+                            )
+                        )
+                    ):
+                        review_note = (
+                            'Expedia could not display the virtual card information after '
+                            'refreshing; verify its status and amount manually.'
+                        )
+                        if review_identity['Reservation Canceled']:
+                            review_note = 'Reservation is canceled; verify card charge eligibility. ' + review_note
+                        if review_identity['Charge Window Passed']:
+                            review_note += ' The 180-day charge window has passed.'
+                        new_row = pd.DataFrame([{
+                            **review_identity,
+                            'Credit Card Number': '',
+                            'Credit Card Expiry': '',
+                            'Amount Due': None,
+                            'Status': 'Virtual card unavailable',
+                            'Needs Review': True,
+                            'Review Note': review_note,
+                        }])
+                        data = pd.concat([data, new_row], ignore_index=True)
+                        if checkpoint_path:
+                            data.to_csv(checkpoint_path, index=False)
+                        status_counts['Virtual card unavailable'] += 1
+                        print(f"Review needed ({row_context}): {review_note}")
+                        rows, row_number = restore_reservation_page(
+                            driver, search_url, page_number, original_row_text, row_context,
+                        )
+                        row_number += 1
+                        row_retry_count = 0
+                        continue
                     raise RuntimeError(
                         f"Expedia could not recover the reservation details after two attempts "
                         f"({row_context}). Completed results are saved to the progress CSV."
