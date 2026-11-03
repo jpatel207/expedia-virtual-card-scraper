@@ -14,7 +14,6 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -178,6 +177,89 @@ def should_include_reservation(status_text: str, payment: dict) -> bool:
     amount_due = payment['Amount Due']
     return status_text == 'Partially charged' and amount_due is not None and amount_due >= 5
 
+
+def submit_password_with_retry(driver: webdriver.Chrome, password: str, max_retries: int = 2) -> None:
+    """Submit the Expedia password and retry only when its transient error banner appears."""
+    password_input = WebDriverWait(driver, 10).until(
+        EC.visibility_of_element_located((By.NAME, 'password'))
+    )
+    password_input.send_keys(password)
+    continue_button = (By.XPATH, "//button[normalize-space(.)='Continue']")
+
+    def error_banner_visible(browser) -> bool:
+        try:
+            return 'something went wrong' in browser.find_element(By.TAG_NAME, 'body').text.casefold()
+        except NoSuchElementException:
+            return False
+
+    def password_page_visible(browser) -> bool:
+        try:
+            return any(element.is_displayed() for element in browser.find_elements(By.NAME, 'password'))
+        except StaleElementReferenceException:
+            return True
+
+    for attempt in range(max_retries + 1):
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(continue_button)).click()
+        try:
+            WebDriverWait(driver, 8).until(
+                lambda browser: error_banner_visible(browser) or not password_page_visible(browser)
+            )
+        except TimeoutException:
+            # Leave an unchanged page for the existing visible login confirmation step.
+            return
+
+        if not error_banner_visible(driver):
+            return
+        if attempt < max_retries:
+            print(f"Expedia showed a temporary sign-in error; retrying Continue ({attempt + 1}/{max_retries}).")
+        else:
+            print("Expedia still shows a sign-in error after retries; inspect Chrome before continuing.")
+
+
+def submit_email_with_retry(driver: webdriver.Chrome, user_name: str, max_retries: int = 2) -> None:
+    """Submit the Expedia email and retry only when its transient error banner appears."""
+    email_input = WebDriverWait(driver, 10).until(
+        EC.visibility_of_element_located((By.NAME, 'username'))
+    )
+    email_input.send_keys(user_name)
+    continue_button = (By.XPATH, "//button[normalize-space(.)='Continue']")
+
+    def error_banner_visible(browser) -> bool:
+        try:
+            return 'something went wrong' in browser.find_element(By.TAG_NAME, 'body').text.casefold()
+        except NoSuchElementException:
+            return False
+
+    def email_page_visible(browser) -> bool:
+        try:
+            return any(element.is_displayed() for element in browser.find_elements(By.NAME, 'username'))
+        except StaleElementReferenceException:
+            return True
+
+    for attempt in range(max_retries + 1):
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(continue_button)).click()
+        try:
+            WebDriverWait(driver, 8).until(
+                lambda browser: error_banner_visible(browser) or not email_page_visible(browser)
+            )
+        except TimeoutException:
+            return
+
+        if not error_banner_visible(driver):
+            return
+        if attempt < max_retries:
+            print(f"Expedia showed a temporary sign-in error; retrying Continue ({attempt + 1}/{max_retries}).")
+        else:
+            print("Expedia still shows a sign-in error after retries; inspect Chrome before continuing.")
+
+
+def save_auth_cookies(driver: webdriver.Chrome) -> None:
+    """Refresh the local cookie backup after the user confirms a successful sign-in."""
+    local_data_dir = 'local-data'
+    os.makedirs(local_data_dir, exist_ok=True)
+    with open(os.path.join(local_data_dir, 'cookies.pkl'), 'wb') as cookie_file:
+        pickle.dump(driver.get_cookies(), cookie_file)
+
 def generate_monthly_date_ranges(start_date: str, end_date: str) -> list:
     """Generate monthly date ranges between two dates."""
     current = datetime.strptime(start_date, '%Y-%m-%d')
@@ -268,6 +350,69 @@ def wait_for_reservation_element(driver, locator, stage: str, timeout: int = 20)
         ) from exc
 
 
+RESERVATION_TABLE_XPATH = '//*[@id="content"]/div/div[3]/div/div/div[2]/div/div/div[2]/table/tbody'
+NEXT_PAGE_XPATH = '//*[@id="content"]/div/div[3]/div/div/div[2]/div/nav/div/div[2]/button'
+
+
+def get_reservation_rows(driver, stage: str):
+    """Wait for and return the currently visible reservation rows."""
+    wait_for_reservation_element(
+        driver, (By.XPATH, RESERVATION_TABLE_XPATH), stage, timeout=45,
+    )
+    return WebDriverWait(driver, 25).until(
+        lambda browser: browser.find_elements(
+            By.XPATH, f'{RESERVATION_TABLE_XPATH}/tr'
+        ) or False
+    )
+
+
+def restore_reservation_page(
+    driver, search_url: str, page_number: int, target_row_text: str,
+    row_context: str,
+):
+    """Reload the search, restore its UI page, and locate the failed row by its text."""
+    driver.get(search_url)
+    rows = get_reservation_rows(driver, f"restoring reservations ({row_context})")
+
+    for page_to_open in range(2, page_number + 1):
+        next_button = WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.XPATH, NEXT_PAGE_XPATH))
+        )
+        if "disabled" in (next_button.get_attribute("class") or "").casefold() or next_button.get_attribute("disabled") is not None:
+            raise RuntimeError(
+                f"Could not restore page {page_number} while recovering from {row_context}; "
+                f"the Next button stopped at page {page_to_open - 1}."
+            )
+        old_first_text = rows[0].text
+        next_button.click()
+        WebDriverWait(driver, 25).until(
+            lambda browser: (
+                (visible_rows := browser.find_elements(
+                    By.XPATH, f'{RESERVATION_TABLE_XPATH}/tr'
+                )) and visible_rows[0].text != old_first_text
+            )
+        )
+        rows = get_reservation_rows(
+            driver, f"restoring page {page_to_open} ({row_context})",
+        )
+
+    if not target_row_text:
+        return rows, 1
+
+    normalized_target = " ".join(target_row_text.split())
+    matches = [
+        index for index, row in enumerate(rows, start=1)
+        if " ".join(row.text.split()) == normalized_target
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Recovered the reservations page for {row_context}, but could not uniquely "
+            "identify the failed row from its visible reservation text. The scan stopped "
+            "with its completed results saved."
+        )
+    return rows, matches[0]
+
+
 def read_reservation_status(driver, row_context: str) -> tuple[str, str]:
     """Read the status text from the rendered reservation panel."""
     known_statuses = (
@@ -288,13 +433,84 @@ def read_reservation_status(driver, row_context: str) -> tuple[str, str]:
 
     try:
         return WebDriverWait(driver, 20).until(find_status)
-    except TimeoutException as exc:
-        raise TimeoutException(
-            f"Timed out while reading a recognized reservation status ({row_context})."
-        ) from exc
+    except TimeoutException:
+        # Preserve the panel for review rather than abandoning the entire scan
+        # when Expedia introduces a new status label.
+        try:
+            panel_text = driver.find_element(By.ID, 'sidePanelDialog').text
+        except NoSuchElementException as exc:
+            raise RuntimeError(
+                f"Reservation details panel disappeared while reading the card status "
+                f"({row_context})."
+            ) from exc
+        return 'Unrecognized status', panel_text
 
 
-def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, start: str, end: str, debug: bool = False) -> pd.DataFrame:
+def refresh_virtual_card_if_available(driver, row_context: str, debug: bool = False) -> None:
+    """Use Expedia's one-shot card reload control, then wait for its status to render."""
+    lower = "translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+    lower_label = "translate(concat(@aria-label, ' ', @title), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+    reload_xpath = (
+        "//*[@id='sidePanelDialog']//*[self::button or self::a or @role='button']["
+        f"contains({lower}, 'reload') or contains({lower}, 'refresh') or "
+        f"contains({lower_label}, 'reload') or contains({lower_label}, 'refresh')]"
+    )
+    reload_buttons = [
+        element for element in driver.find_elements(By.XPATH, reload_xpath)
+        if element.is_displayed() and element.is_enabled()
+    ]
+    if not reload_buttons:
+        return
+
+    reload_button = reload_buttons[0]
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+        reload_button,
+    )
+    reload_button.click()
+    if debug:
+        print(f"Reloading the virtual card box once: {row_context}")
+
+    card_statuses = {'Charged in full', 'Partially charged', 'Ready to charge', 'Refund due', 'Deactivated'}
+
+    def card_status_visible(browser):
+        try:
+            lines = {
+                line.strip().casefold()
+                for line in browser.find_element(By.ID, 'sidePanelDialog').text.splitlines()
+                if line.strip()
+            }
+            return any(status.casefold() in lines for status in card_statuses)
+        except (NoSuchElementException, StaleElementReferenceException):
+            return False
+
+    try:
+        WebDriverWait(driver, 45).until(card_status_visible)
+    except TimeoutException:
+        try:
+            driver.find_element(By.ID, 'sidePanelDialog')
+        except NoSuchElementException as exc:
+            raise RuntimeError(
+                f"Reservation details panel disappeared while refreshing the virtual card "
+                f"({row_context})."
+            ) from exc
+        if debug:
+            print(f"Card status did not appear after reload; keeping the reservation for review: {row_context}")
+
+
+def read_optional_panel_text(driver, xpath: str) -> str:
+    """Read a panel field when present; return blank if Expedia omitted it."""
+    try:
+        return driver.find_element(By.XPATH, xpath).text.strip()
+    except NoSuchElementException:
+        return ''
+
+
+def gather_data(
+    data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str,
+    start: str, end: str, debug: bool = False,
+    checkpoint_path: str | None = None,
+) -> pd.DataFrame:
     """Gather data from the reservation table."""
     status_counts = Counter()
     initial_report_rows = len(data)
@@ -302,28 +518,46 @@ def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, star
     payload = build_payload(start, end)
     # print(f"Payload: {payload}")
 
-    driver.get(f"https://apps.expediapartnercentral.com/lodging/bookings?htid={prop_id}#{payload}")
+    search_url = f"https://apps.expediapartnercentral.com/lodging/bookings?htid={prop_id}#{payload}"
+    driver.get(search_url)
     time.sleep(20)
 
     # Runs until the 'Next' button is disabled
     page_number = 1
     while True:
         scan_context = f"{start} to {end}, page {page_number}"
-        table = wait_for_reservation_element(
-            driver,
-            (By.XPATH, '//*[@id="content"]/div/div[3]/div/div/div[2]/div/div/div[2]/table/tbody'),
-            f"loading the reservations table ({scan_context})",
-        )
-
-        # Get all rows in the table (excluding header row)
-        rows = WebDriverWait(table, 25).until(
-            EC.presence_of_all_elements_located((By.TAG_NAME, 'tr'))
-        )
+        page_load_retries = 0
+        while True:
+            try:
+                rows = get_reservation_rows(
+                    driver, f"loading the reservations table ({scan_context})",
+                )
+                break
+            except RuntimeError as exc:
+                if "reservations cannot be loaded" not in str(exc).casefold() or page_load_retries >= 2:
+                    raise
+                page_load_retries += 1
+                print(
+                    f"Expedia could not load {scan_context}; reloading the search "
+                    f"(attempt {page_load_retries} of 2)."
+                )
+                try:
+                    rows, _ = restore_reservation_page(
+                        driver, search_url, page_number, "", scan_context,
+                    )
+                except RuntimeError as recovery_error:
+                    if "reservations cannot be loaded" in str(recovery_error).casefold() and page_load_retries < 2:
+                        continue
+                    raise
         # print(rows)
 
         # Loop through each row and interact with the button
-        for row_number, row in enumerate(rows, start=1):
+        row_number = 1
+        row_retry_count = 0
+        while row_number <= len(rows):
+            row = rows[row_number - 1]
             row_context = f"{scan_context}, row {row_number} of {len(rows)}"
+            original_row_text = row.text
             if debug:
                 print(f"Opening reservation details: {row_context}")
             # Find the button within the row
@@ -342,18 +576,24 @@ def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, star
                 )
                 if debug:
                     print(f"Details panel opened; waiting for card status: {row_context}")
+                refresh_virtual_card_if_available(driver, row_context, debug=debug)
                 status_text, panel_text = read_reservation_status(driver, row_context)
                 status_counts[status_text] += 1
                 reservation_cancelled = any(
                     line.strip().casefold() in {'canceled', 'cancelled'}
                     for line in panel_text.splitlines()
                 )
+                has_virtual_card = 'virtual card' in panel_text.casefold()
 
-                if status_text in {'Canceled', 'Cancelled'}:
-                    if 'virtual card' not in panel_text.casefold():
+                if status_text in {'Canceled', 'Cancelled', 'Unrecognized status'}:
+                    if not has_virtual_card:
                         if debug:
-                            print(f"Skipping canceled reservation without a virtual card: {row_context}")
+                            print(f"Skipping reservation without a recognized card status or virtual card: {row_context}")
                         driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/header/button').click()
+                        row_number += 1
+                        row_retry_count = 0
+                        if checkpoint_path:
+                            data.to_csv(checkpoint_path, index=False)
                         continue
 
                 payment_details_text = ''
@@ -372,20 +612,24 @@ def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, star
                 check_out_date = datetime.strptime(check_out_date_str, '%m/%d/%Y')
                 guest_name = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[1]/div[1]/div[2]/div').text.strip()
                 expedia_number = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[1]/header/h3/span/span').text.strip().lstrip('#')
-                cc_number = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[2]').text.strip()
-                cc_exp = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[4]/div[1]').text.strip()
+                cc_number = read_optional_panel_text(
+                    driver,
+                    '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[2]',
+                )
+                cc_exp = read_optional_panel_text(
+                    driver,
+                    '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[4]/div[1]',
+                )
+                if not cc_number or not cc_exp:
+                    payment['Needs Review'] = True
+                    missing_card_detail_note = 'Virtual card details were not fully read.'
+                    payment['Review Note'] = ' '.join(
+                        note for note in (payment['Review Note'], missing_card_detail_note) if note
+                    )
                 if debug and payment['Needs Review']:
                     print(f"Review needed ({row_context}): {payment['Review Note']}")
 
                 if should_include_reservation(status_text, payment):
-                    check_in_date_str, check_out_date_str = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[2]/div[1]/div/div[1]/div').text.split('\n')[0].split(' - ')
-                    # Convert the date strings to datetime objects
-                    check_in_date = datetime.strptime(check_in_date_str, '%m/%d/%Y')
-                    check_out_date = datetime.strptime(check_out_date_str, '%m/%d/%Y')
-                    guest_name = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[1]/div[1]/div[2]/div').text.strip()
-                    expedia_number = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[1]/header/h3/span/span').text.strip().lstrip('#')
-                    cc_number = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[2]').text.strip()
-                    cc_exp = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[3]/div/div[2]/div/div[1]/div/div[2]/div[4]/div[1]').text.strip()
                     try: # Not all reservations might have a hotel confirmation number
                         hotel_confirmation = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/div/div/div[2]/div/div[2]/div[2]/div/div/div[2]/div/span').text.strip().lstrip('#')
                     except (NoSuchElementException):
@@ -408,6 +652,8 @@ def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, star
 
                     # Append the new row to the existing DataFrame
                     data = pd.concat([data, new_row], ignore_index=True)
+                    if checkpoint_path:
+                        data.to_csv(checkpoint_path, index=False)
 
                 # exit_button = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/header/button')
                 # exit_button.click()
@@ -427,15 +673,41 @@ def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, star
                 # exit_button = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/header/button') # Exit the side panel dialog to avoid stuck panels even during element missing errors
                 # exit_button.click()
                 pass
+            except RuntimeError as exc:
+                error_text = str(exc).casefold()
+                recoverable_failure = (
+                    "reservations cannot be loaded" in error_text
+                    or "reservation details panel disappeared" in error_text
+                )
+                if not recoverable_failure:
+                    raise
+                if row_retry_count >= 2:
+                    raise RuntimeError(
+                        f"Expedia could not recover the reservation details after two attempts "
+                        f"({row_context}). Completed results are saved to the progress CSV."
+                    ) from exc
+                row_retry_count += 1
+                print(
+                    f"Expedia lost the reservation details at {row_context}; restoring the "
+                    f"search and retrying that row (attempt {row_retry_count} of 2)."
+                )
+                rows, row_number = restore_reservation_page(
+                    driver, search_url, page_number, original_row_text, row_context,
+                )
+                continue
 
 
             exit_button = driver.find_element(By.XPATH, '//*[@id="sidePanelDialog"]/div/div/header/button')
             exit_button.click()
             # time.sleep(5)
+            row_number += 1
+            row_retry_count = 0
+            if checkpoint_path:
+                data.to_csv(checkpoint_path, index=False)
         try:
             # Wait until the 'Next' button is present and visible
             next_button = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="content"]/div/div[3]/div/div/div[2]/div/nav/div/div[2]/button'))
+                EC.presence_of_element_located((By.XPATH, NEXT_PAGE_XPATH))
             )
 
             # Scroll the next_button into view
@@ -447,7 +719,15 @@ def gather_data(data: pd.DataFrame, driver: webdriver.Chrome, prop_id: str, star
             if is_disabled:
                 break
             else:
+                old_first_text = rows[0].text
                 ActionChains(driver).move_to_element(next_button).click().perform()
+                WebDriverWait(driver, 25).until(
+                    lambda browser: (
+                        (visible_rows := browser.find_elements(
+                            By.XPATH, f'{RESERVATION_TABLE_XPATH}/tr'
+                        )) and visible_rows[0].text != old_first_text
+                    )
+                )
                 page_number += 1
         except (NoSuchElementException, TimeoutException) as e:
             if debug:
@@ -538,6 +818,9 @@ def main(debug: bool = False, manual_login: bool = False):
     # Set up Chrome options for headless mode
     # Disable headless temporarily to debug
     chrome_options = Options()
+    chrome_profile = os.path.abspath(os.path.join('local-data', 'chrome-profile'))
+    os.makedirs(chrome_profile, exist_ok=True)
+    chrome_options.add_argument(f'--user-data-dir={chrome_profile}')
     # chrome_options.add_argument("--headless")
     # chrome_options.add_argument("--disable-gpu")
     # chrome_options.add_argument("--window-size=1920,1080")
@@ -562,20 +845,20 @@ def main(debug: bool = False, manual_login: bool = False):
         for cookie in cookies:
             if 'domain' not in cookie or cookie['domain'] in current_domain:
                 driver.add_cookie(cookie)
+        driver.refresh()
+        time.sleep(2)
 
-        # Log in
-        user_name = os.environ.get("USER")
-        password = os.environ.get("PASSWORD")
-        user_input = WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.NAME, "username"))
+        # Reuse the authenticated Chrome profile when Expedia still trusts it.
+        login_form_visible = any(
+            element.is_displayed() for element in driver.find_elements(By.NAME, 'username')
         )
-        user_input.send_keys(user_name)
-        user_input.send_keys(Keys.RETURN)
-        password_input = WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.NAME, "password"))
-        )
-        password_input.send_keys(password)
-        password_input.send_keys(Keys.RETURN)
+        if login_form_visible:
+            user_name = os.environ.get("USER")
+            password = os.environ.get("PASSWORD")
+            submit_email_with_retry(driver, user_name)
+            submit_password_with_retry(driver, password)
+        else:
+            print("No sign-in form is visible; continuing with the saved Chrome session.")
 
     if debug:
         # Let us observe sign-in before navigating away to the reservations page.
@@ -590,19 +873,34 @@ def main(debug: bool = False, manual_login: bool = False):
             print("Login was not confirmed. Stopping before opening reservations.")
             driver.quit()
             return
+        save_auth_cookies(driver)
     else:
         time.sleep(2)
+        save_auth_cookies(driver)
+
+    os.makedirs('local-data', exist_ok=True)
+    run_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    progress_csv_path = os.path.join('local-data', f'{run_stamp}_data_in_progress.csv')
+    csv_path = os.path.join('local-data', f'{run_stamp}_data.csv')
+    # Keep an explicitly marked partial report and update it after each row.
+    data.to_csv(progress_csv_path, index=False)
+    print(f"Progress report will be updated after each reservation: {progress_csv_path}")
 
     # Handle date splitting
     if (datetime.strptime(end_date, '%Y-%m-%d') - datetime.strptime(start_date, '%Y-%m-%d')).days <= 31: # fix this
         print(f"Single month range: {start_date} to {end_date}")
-        new_rows = gather_data(data, driver, prop_id, start_date, end_date, debug=debug)
-        data = pd.concat([data, new_rows], ignore_index=True)
+        data = gather_data(
+            data, driver, prop_id, start_date, end_date,
+            debug=debug, checkpoint_path=progress_csv_path,
+        )
     else:
         ranges = generate_monthly_date_ranges(start_date, end_date)
         for start, end in ranges:
             print(f"Fetching data from {start} to {end}")
-            data = gather_data(data, driver, prop_id, start, end, debug=debug)
+            data = gather_data(
+                data, driver, prop_id, start, end,
+                debug=debug, checkpoint_path=progress_csv_path,
+            )
             # data = pd.concat([data, new_rows], ignore_index=True)
 
     # Close the driver
@@ -610,12 +908,9 @@ def main(debug: bool = False, manual_login: bool = False):
     print(data)
 
     # Create CSV file if data is present
+    data.to_csv(progress_csv_path, index=False)
+    os.replace(progress_csv_path, csv_path)
     if len(data) > 0:
-        os.makedirs('local-data', exist_ok=True)
-        csv_path = os.path.join(
-            'local-data', f'{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_data.csv'
-        )
-        data.to_csv(csv_path, index=False)
         review_rows = int(data['Needs Review'].fillna(False).sum()) if 'Needs Review' in data else 0
         print(f"Saved {len(data)} report rows ({review_rows} flagged for review) to {csv_path}")
 
@@ -624,7 +919,7 @@ def main(debug: bool = False, manual_login: bool = False):
         else:
             send_email(data)
     else:
-        print("No reservations matched the report filters; no CSV was created.")
+        print(f"No reservations matched the report filters; an empty report was saved to {csv_path}")
 
 def run_debug(manual_login: bool = False) -> int:
     """Show failures and pause so the browser can be inspected before exiting."""
