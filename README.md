@@ -77,7 +77,8 @@ Close the previous script-controlled Chrome window before starting another run u
 | --- | --- | --- | --- |
 | `main.py --manual-login` | Sign in yourself; skips loading the cookie backup and automatic credential entry. Still uses the saved Chrome profile. | Visible terminal progress; pauses for inspection after an error. | Skipped |
 | `main.py --debug` | Uses saved cookies/profile and attempts automatic sign-in when needed. Pauses for you to confirm the dashboard. | Visible terminal progress; pauses for inspection after an error. | Skipped |
-| `main.py` | Uses saved cookies/profile and attempts automatic sign-in when needed. | Redirects console output to a timestamped `*_output.log` in the project folder. | Sends an HTML report if the scan finishes with report rows. |
+| `main.py` | Uses saved cookies/profile and attempts automatic sign-in when needed. | Redirects console output to a timestamped `*_output.log` in the project folder. | Sends the report as text and HTML in the email, plus a CSV attachment, if the scan finishes with report rows. |
+| `main.py --previous-month` | Uses saved cookies/profile and attempts automatic sign-in when needed. | Scans the previous calendar month without prompting for dates; logs output to a timestamped `*_output.log`. | Emails the text and HTML report with its CSV attachment after completion, even if no report rows matched. |
 
 For example, test saved-session login with:
 
@@ -91,11 +92,18 @@ Run normally with:
 .\.venv\Scripts\python.exe main.py
 ```
 
+Run the previous calendar month's report without entering a date range:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --previous-month
+```
+
 All modes currently open a visible Chrome window. Use manual login or debug mode when sign-in needs your attention. In normal mode, the date-range prompts are also redirected to the log file, so check that file if the terminal appears to be waiting without displaying a prompt.
 
 ### Date-range options
 
 - **YTD:** January 1 of the current year through yesterday.
+- **PREVIOUS_MONTH:** The first through last day of the previous calendar month. Select this in the prompt, or use `--previous-month` to skip the date-range prompt.
 - **CUSTOM:** Enter start and end dates in `YYYY-MM-DD` format.
 - **L12M:** The date one year before today through yesterday.
 
@@ -148,7 +156,7 @@ The script can click a visible virtual-card reload control when a card fails to 
 
 ## Local files and Git
 
-The repository's `.gitignore` excludes `local-data/`, `.venv/`, and root-level `*_data.csv` files. Keep credentials, reports, cookies, Chrome session data, and screenshots in `local-data/`.
+The repository's `.gitignore` excludes `local-data/`, `.venv/`, and root-level `*_data.csv` files. Keep credentials, reports, cookies, Chrome session data, and screenshots in `local-data/`. Email reports contain reservation details and full virtual card numbers; make sure `RECEIVER_EMAIL` is an authorized, secure mailbox.
 
 Reports contain guest and payment-card information, and the Chrome profile and cookies contain session information. Keep these files private. Normal runs currently write `*_output.log` files in the project folder; those logs are not covered by the current ignore rules, so review them before staging files for Git.
 

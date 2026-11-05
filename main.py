@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from webdriver_manager.chrome import ChromeDriverManager
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 
@@ -863,31 +864,40 @@ def gather_data(
     driver.get("https://apps.expediapartnercentral.com") # Go back to the main page
     return data
 
-def send_email(data): # work in progress (include cases where the scraping fails for some reason based on the try except clauses below - eg Expedia website down or UI changes)
+def send_email(data, csv_path: str):
     sender_email = os.environ.get("EMAIL_ADDRESS")
     receiver_email = os.environ.get("RECEIVER_EMAIL")
-    email_password = os.environ.get("EMAIL_PASSWORD") # NEED TO PUT APP PASSWORD IN ENV FILE
+    email_password = os.environ.get("EMAIL_PASSWORD")
     smtp_server = "smtp.gmail.com"
     smtp_port = 587
 
     df_html = data.to_html(index=False, border=1)
-    # customize the email based on the dates (first paragraph part in particular)
     html_body = f"""
     <html>
         <body>
             <p>Here is the Expedia Virtual Card data:</p>
             {df_html}
-            <p>Best regards,<br>Your Raspberry Pi</p>
         </body>
     </html>
     """
+    text_body = "Here is the Expedia Virtual Card data:\n\n" + data.to_csv(index=False)
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("mixed")
     msg['From'] = sender_email
     msg['To'] = receiver_email
     msg['Subject'] = "Expedia Virtual Card Report"
 
-    msg.attach(MIMEText(html_body, "html"))
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(text_body, "plain", "utf-8"))
+    body.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(body)
+
+    with open(csv_path, "rb") as csv_file:
+        attachment = MIMEApplication(csv_file.read(), _subtype="csv")
+    attachment.add_header(
+        "Content-Disposition", "attachment", filename=os.path.basename(csv_path),
+    )
+    msg.attach(attachment)
 
     try:
         # Send email
@@ -900,7 +910,7 @@ def send_email(data): # work in progress (include cases where the scraping fails
     except Exception as e:
         print(f"Error sending email: {e}")
 
-def main(debug: bool = False, manual_login: bool = False):
+def main(debug: bool = False, manual_login: bool = False, previous_month: bool = False):
     # Manual login is a diagnostic mode: keep output visible and never email results.
     debug = debug or manual_login
     data = pd.DataFrame(columns=[
@@ -912,10 +922,18 @@ def main(debug: bool = False, manual_login: bool = False):
     prop_id = os.environ.get("PROP_ID")
 
 
-    option = input("Choose an option (YTD, CUSTOM, L12M): ").strip().upper()
+    option = 'PREVIOUS_MONTH' if previous_month else input(
+        "Choose an option (PREVIOUS_MONTH, YTD, CUSTOM, L12M): "
+    ).strip().upper()
     
     # This is a temporary solution to handle the different date ranges
-    if option == 'YTD':
+    if option == 'PREVIOUS_MONTH':
+        current_month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        previous_month_end = current_month_start - timedelta(days=1)
+        previous_month_start = previous_month_end.replace(day=1)
+        start_date = previous_month_start.strftime('%Y-%m-%d')
+        end_date = previous_month_end.strftime('%Y-%m-%d')
+    elif option == 'YTD':
         start_date = f"{datetime.now().year}-01-01"
         end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     elif option == 'CUSTOM':
@@ -1033,14 +1051,19 @@ def main(debug: bool = False, manual_login: bool = False):
         if debug:
             print("Debug mode: email skipped.")
         else:
-            send_email(data)
+            send_email(data, csv_path)
     else:
         print(f"No reservations matched the report filters; an empty report was saved to {csv_path}")
+        if option == 'PREVIOUS_MONTH':
+            if debug:
+                print("Debug mode: email skipped.")
+            else:
+                send_email(data, csv_path)
 
-def run_debug(manual_login: bool = False) -> int:
+def run_debug(manual_login: bool = False, previous_month: bool = False) -> int:
     """Show failures and pause so the browser can be inspected before exiting."""
     try:
-        main(debug=True, manual_login=manual_login)
+        main(debug=True, manual_login=manual_login, previous_month=previous_month)
     except Exception:
         traceback.print_exc()
         try:
@@ -1066,13 +1089,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Sign in yourself without loading saved cookies. Enables debug mode and skips email.",
     )
+    parser.add_argument(
+        "--previous-month",
+        action="store_true",
+        help="Scan the previous calendar month without asking for a date range.",
+    )
     args = parser.parse_args()
     if args.debug or args.manual_login:
         print("Debug mode: output is shown here, scraping errors stop the run, and email is disabled.")
-        sys.exit(run_debug(manual_login=args.manual_login))
+        sys.exit(run_debug(
+            manual_login=args.manual_login, previous_month=args.previous_month,
+        ))
     else:
         log_file = open(f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_output.log", "w")
         sys.stdout = log_file
         sys.stderr = log_file
-        main()
+        main(previous_month=args.previous_month)
         log_file.close()
